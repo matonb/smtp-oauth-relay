@@ -1,0 +1,140 @@
+---
+name: Build
+
+on:
+  push:
+    branches:
+      - hardened
+  workflow_dispatch:
+    inputs:
+      relay_version:
+        description: 'Version tag to build (defaults to git describe)'
+        required: false
+
+env:
+  IMAGE: docker.io/matonb/smtp-oauth-relay
+  BASE_IMAGE: dhi.io/python:3.13-alpine
+
+# amd64 and arm64 are built natively on their own runners rather than
+# cross-built under QEMU, then merged into one multi-arch manifest - QEMU
+# cross-builds are slow and occasionally flaky, and a native arm64 runner is
+# available, so there's no reason to emulate.
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    outputs:
+      relay_version: ${{ steps.version.outputs.relay_version }}
+      app_version: ${{ steps.version.outputs.app_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.relay_version }}" ]; then
+            RELAY_VERSION="${{ github.event.inputs.relay_version }}"
+          else
+            RELAY_VERSION=$(git describe --tags --always)
+          fi
+          # Nearest tag only, no commit-count/hash suffix - CI-only commits
+          # (Dockerfile/workflow patches) don't change the upstream app, so
+          # this reflects the actual relay version, not the patch count.
+          APP_VERSION=$(git describe --tags --abbrev=0 --always)
+          echo "relay_version=$RELAY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    name: Build amd64
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # DHI images are served from a separate registry (dhi.io, not
+      # docker.io/dhi/...) - same Docker Hub credentials, but pulling the
+      # base image needs its own login before the build step.
+      - name: Log in to DHI
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            RELAY_VERSION=${{ needs.version.outputs.relay_version }}
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+          tags: ${{ env.IMAGE }}:${{ needs.version.outputs.relay_version }}-amd64
+
+  build-arm64:
+    name: Build arm64
+    needs: version
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to DHI
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push arm64
+        run: |
+          TARGET="$IMAGE:${{ needs.version.outputs.relay_version }}-arm64"
+          docker build \
+            --build-arg "RELAY_VERSION=${{ needs.version.outputs.relay_version }}" \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            -t "$TARGET" \
+            .
+          docker push "$TARGET"
+
+  manifest:
+    name: Push multi-arch manifest
+    needs: [version, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch tags
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:${{ needs.version.outputs.relay_version }}" \
+            --tag "$IMAGE:${{ needs.version.outputs.app_version }}" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE:${{ needs.version.outputs.relay_version }}-amd64" \
+            "$IMAGE:${{ needs.version.outputs.relay_version }}-arm64"

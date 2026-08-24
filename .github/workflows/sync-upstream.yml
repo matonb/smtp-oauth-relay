@@ -1,0 +1,78 @@
+---
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+# main is kept as a pure, untouched mirror of upstream so it can always be
+# fast-forwarded cleanly. All hardening patches (Dockerfile, this workflow,
+# build.yml) live only on `hardened`, which is periodically merged (not
+# rebased - an unattended rebase means an unattended force-push, and a
+# botched one gives no clean failure signal) with the refreshed main. A
+# real conflict aborts the merge and opens an issue instead of forcing
+# anything through.
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: hardened
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward main from upstream
+        run: |
+          git remote add upstream https://github.com/JustinIven/smtp-oauth-relay.git
+          git fetch upstream main
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Merge main into hardened
+        id: merge
+        run: |
+          git checkout hardened
+          if git merge --no-edit main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push hardened
+        if: steps.merge.outputs.conflict == 'false'
+        run: git push origin hardened
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$(gh issue list --label upstream-sync-conflict --state open --json number --jq length)" = "0" ]; then
+            gh issue create \
+              --title "Upstream sync conflict: main -> hardened" \
+              --label upstream-sync-conflict \
+              --body "Automated merge of \`main\` into \`hardened\` hit a conflict and was aborted. Resolve manually:
+
+          \`\`\`
+          git fetch upstream main
+          git checkout main && git merge --ff-only upstream/main && git push origin main
+          git checkout hardened && git merge main
+          # resolve conflicts, then:
+          git push origin hardened
+          \`\`\`
+
+          Close this issue once resolved and pushed."
+          fi
